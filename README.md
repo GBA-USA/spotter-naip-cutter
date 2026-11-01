@@ -30,6 +30,18 @@ Stdout gets exactly one line and stderr gets nothing.
 | `fail:E4` | 1 | Rendering or writing failed. |
 | `fail:E5` | 1 | Upload failed or R2 environment incomplete. |
 
+## Dispatch workflow
+
+`.github/workflows/cut.yml` runs only on a `repository_dispatch` event of type `cut`, with an encrypted cell in `client_payload.c`. It calls `run_job.py`, which decrypts the cell with AES-256-GCM, tells the runner to mask every value derived from it, runs `cut_cell.py` and posts the status word to the callback URL. The run log shows only one fixed line such as `ok callback:ok`.
+
+| Secret | Use |
+| --- | --- |
+| `OD1_CELL_KEY` | 32-byte AES key, standard base64. |
+| `OD1_CALLBACK_URL`, `OD1_CALLBACK_TOKEN` | Status callback and its bearer token. |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT` | Upload target. |
+
+The callback body is `{"c": "<ciphertext as received>", "status": "<word>"}`. The status word is one from the table above. A key or decryption failure reports `fail:E1` without running the cutter. The driver retries the callback twice on a network error or 5xx and never on 4xx. It exits 0 only when the status is `ok` or `none` and the callback succeeded.
+
 ## Tests
 
     pip install -r requirements.txt pytest
