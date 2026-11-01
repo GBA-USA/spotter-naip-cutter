@@ -1,0 +1,9 @@
+boto3==1.43.123
+mercantile==1.2.1
+numpy==2.5.4
+pillow==13.0.0
+planetary-computer==1.0.0
+pmtiles==3.8.1
+pystac-client==0.9.1
+rasterio==1.5.2
+shapely==2.2.0
