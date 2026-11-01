@@ -206,3 +206,147 @@ def test_gap_in_newest_year_is_filled_from_next_newest_only():
 def test_item_touching_only_the_cell_edge_is_ignored():
     picked = cut_cell.pick_sources([fake_source('2022-01-01', (1, 0, 2, 1))], (0, 0, 1, 1))
     assert picked == []
+
+
+def natural_image(size=512, seed=7):
+    rng = np.random.default_rng(seed)
+    coarse = rng.integers(50, 190, (3, 16, 16), np.uint8)
+    bands = [np.asarray(Image.fromarray(band).resize((size, size), Image.BICUBIC), float)
+             for band in coarse]
+    grain = rng.normal(0, 4, (3, size, size))
+    return np.clip(np.stack(bands) + grain, 1, 255).astype(np.uint8)
+
+
+def identity():
+    return np.tile(np.arange(256, dtype=np.uint8), (3, 1))
+
+
+def rgba_of(rgb):
+    return np.dstack([*rgb, np.full(rgb.shape[1:], 255, np.uint8)])
+
+
+def tile_raster(path, pixels, tile):
+    with rasterio.open(path, 'w', driver='GTiff', width=pixels.shape[2], height=pixels.shape[1],
+                       count=3, dtype='uint8', crs='EPSG:3857', nodata=0,
+                       transform=from_bounds(*mercantile.xy_bounds(tile), pixels.shape[2],
+                                             pixels.shape[1])) as dst:
+        dst.write(pixels)
+
+
+def test_match_brings_a_secondary_source_to_the_primary():
+    primary = natural_image()
+    primary[:, :, 300:] = 0
+    secondary = np.clip(natural_image() * 0.8 + 40, 1, 255).astype(np.uint8)
+    secondary[:, :, :200] = 0
+    tables, _ = cut_cell.match_sources([primary, secondary])
+    matched = cut_cell.apply_table(tables[1], secondary)
+    overlap = primary.any(0) & secondary.any(0)
+    assert np.abs(primary[:, overlap].astype(float) - matched[:, overlap]).mean() < 1.5
+    assert np.abs(primary[:, overlap].astype(float) - secondary[:, overlap]).mean() > 10
+
+
+def test_source_without_overlap_matches_the_whole_mosaic():
+    primary = natural_image()
+    primary[:, :, 256:] = 0
+    secondary = np.clip(natural_image() * 0.9 + 15, 1, 255).astype(np.uint8)
+    secondary[:, :, :256] = 0
+    tables, _ = cut_cell.match_sources([primary, secondary])
+    matched = cut_cell.apply_table(tables[1], secondary)
+    gap = abs(primary[:, primary.any(0)].mean() - matched[:, secondary.any(0)].mean())
+    assert gap < 1
+
+
+def test_single_source_is_not_color_matched():
+    tables, _ = cut_cell.match_sources([natural_image()])
+    assert np.array_equal(tables[0], identity())
+
+
+def test_match_gain_stays_inside_its_limits():
+    primary = natural_image()
+    flat = np.full_like(primary, 100)
+    tables, _ = cut_cell.match_sources([primary, flat])
+    gain = tables[1][:, 1] - tables[1][:, 0]
+    assert (gain <= cut_cell.MATCH_GAIN_LIMITS[1] + 1e-9).all()
+
+
+def test_contrast_is_subtle_and_deterministic():
+    pixels = natural_image()
+    table, = cut_cell.plan_tables([pixels])
+    assert np.array_equal(table, cut_cell.plan_tables([pixels])[0])
+    stretched = cut_cell.apply_table(table, pixels)
+    assert stretched.shape == pixels.shape
+    assert np.abs(stretched.astype(float) - pixels).mean() < 4
+    assert stretched.std() > pixels.std()
+    assert stretched.std() <= pixels.std() * cut_cell.STRETCH_MAX_GAIN + 1
+
+
+def test_contrast_leaves_a_flat_color_alone():
+    table, = cut_cell.plan_tables([np.full((3, 64, 64), 120, np.uint8)])
+    assert (table[:, 120] == 120).all()
+
+
+def test_nothing_valid_in_the_overview_gives_identity_tables():
+    assert np.array_equal(cut_cell.plan_tables([np.zeros((3, 8, 8), np.uint8)])[0], identity())
+
+
+def test_sharpen_is_subtle_and_deterministic():
+    rgba = rgba_of(natural_image())
+    sharp = cut_cell.sharpen(rgba)
+    assert sharp.shape == rgba.shape
+    assert np.array_equal(sharp, cut_cell.sharpen(rgba))
+    assert np.abs(sharp.astype(float) - rgba).mean() < 2
+    assert not np.array_equal(sharp, rgba)
+
+
+def test_sharpen_caps_overshoot_on_a_hard_edge():
+    rgb = np.full((3, 64, 64), 60, np.uint8)
+    rgb[:, :, 32:] = 180
+    sharp = cut_cell.sharpen(rgba_of(rgb))[..., :3]
+    assert sharp.min() >= 60 - cut_cell.SHARPEN_MAX_DELTA
+    assert sharp.max() <= 180 + cut_cell.SHARPEN_MAX_DELTA
+
+
+def test_sharpen_keeps_alpha_nodata_and_pixels_beside_nodata():
+    rgba = rgba_of(natural_image())
+    rgba[:, :200] = 0
+    rgba[200:, 300:, 3] = 128
+    sharp = cut_cell.sharpen(rgba)
+    assert np.array_equal(sharp[..., 3], rgba[..., 3])
+    assert np.array_equal(sharp[:, :203], rgba[:, :203])
+    assert np.array_equal(sharp[200:, 300:], rgba[200:, 300:])
+    assert not np.array_equal(sharp[:, 210:290], rgba[:, 210:290])
+
+
+def test_every_chunk_applies_the_same_table(tmp_path):
+    cell = mercantile.Tile(CELL_X, CELL_Y, 12)
+    dark, bright = mercantile.children(cell, zoom=14)[:2]
+    path = tmp_path / 'scene.tif'
+    tile_raster(path, natural_image(2048), cell)
+    sources = [cut_cell.Source(str(path), '2021-06-01', FOOTPRINT)]
+    table, = cut_cell.plan_tables([cut_cell.read_warped(cell, cut_cell.OVERVIEW_PX, sources[0])])
+    for chunk in (dark, bright):
+        raw = cut_cell.read_chunk(chunk.x, chunk.y, sources, [identity()])
+        graded = cut_cell.read_chunk(chunk.x, chunk.y, sources, [table])
+        expected = cut_cell.apply_table(table, raw[..., :3].transpose(2, 0, 1))
+        assert np.array_equal(graded[..., :3].transpose(2, 0, 1), expected)
+        assert np.array_equal(graded[..., 3], raw[..., 3])
+
+
+def test_seam_between_two_sources_fades_in_the_archive(tmp_path):
+    cell = mercantile.Tile(CELL_X, CELL_Y, 12)
+    base = natural_image(2048)
+    first, second = base.copy(), np.clip(base * 0.8 + 20, 1, 255).astype(np.uint8)
+    first[:, :, 1100:], second[:, :, :950] = 0, 0
+    paths = [tmp_path / 'first.tif', tmp_path / 'second.tif']
+    tile_raster(paths[0], first, cell)
+    tile_raster(paths[1], second, cell)
+    out = tmp_path / 'cell.pmtiles'
+    result = run_cut('--dry-run', '--out', str(out), '--err', str(tmp_path / 'err'),
+                     sources=[[str(paths[0]), '2021-06-02', FOOTPRINT],
+                              [str(paths[1]), '2021-06-01', FOOTPRINT]])
+    assert_status(result, 'ok', 0)
+    with open(out, 'rb') as f:
+        top = np.asarray(archive_tile(Reader(MmapSource(f)), 12, CELL_X, CELL_Y).convert('RGB'), float)
+    plain = np.asarray(Image.fromarray(base.transpose(1, 2, 0)).resize((512, 512), Image.LANCZOS), float)
+    left, right = top[:, 240:262], top[:, 288:310]
+    assert abs((left - plain[:, 240:262]).mean() - (right - plain[:, 288:310]).mean()) < 3

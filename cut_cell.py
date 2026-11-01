@@ -16,6 +16,7 @@ import tempfile
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
+from itertools import repeat
 from typing import NamedTuple
 
 STAC_URL = 'https://planetarycomputer.microsoft.com/api/stac/v1'
@@ -32,6 +33,12 @@ CHUNK_PX = TILE_PX << (MAX_Z - CHUNK_Z)
 WEBP_QUALITY, WEBP_METHOD = 80, 4
 MIN_GAP_FRACTION = 1e-6
 STAC_TIMEOUT_S = 60
+
+OVERVIEW_PX, MIN_OVERLAP_PX = 1024, 256
+MATCH_GAIN_LIMITS = (0.7, 1.4)
+STRETCH_PERCENTILES, STRETCH_MAX_GAIN = (0.5, 99.5), 1.08
+SHARPEN = {'radius': 1, 'percent': 50, 'threshold': 3}
+SHARPEN_MAX_DELTA, SHARPEN_EDGE_PX = 10, 7
 
 GDAL_ENV = {
     'GDAL_DISABLE_READDIR_ON_OPEN': 'EMPTY_DIR',
@@ -110,33 +117,83 @@ def pick_sources(sources, bbox):
     return picked
 
 
-def read_chunk(x, y, sources):
+def read_warped(tile, out_px, source):
     import mercantile
-    import numpy as np
     import rasterio
     from rasterio.enums import Resampling
     from rasterio.transform import from_bounds
     from rasterio.vrt import WarpedVRT
+
+    px = TILE_PX << (MAX_Z - tile.z)
+    with rasterio.open(source.href) as src, WarpedVRT(
+            src, crs='EPSG:3857', transform=from_bounds(*mercantile.xy_bounds(tile), px, px),
+            width=px, height=px, resampling=Resampling.cubic,
+            src_nodata=0, nodata=0) as vrt:
+        return vrt.read((1, 2, 3), out_shape=(3, out_px, out_px))
+
+
+def apply_table(table, pixels):
+    import numpy as np
+
+    return table[np.arange(3)[:, None, None], pixels]
+
+
+def match_sources(overviews):
+    import numpy as np
+
+    levels = np.arange(256.0)
+    mosaic = np.zeros_like(overviews[0], float)
+    seen = np.zeros(mosaic.shape[1:], bool)
+    tables = []
+    for pixels in overviews:
+        valid = pixels.any(0)
+        table = np.tile(levels, (3, 1))
+        if seen.any() and valid.any():
+            shared = valid & seen
+            own, other = (shared, shared) if shared.sum() >= MIN_OVERLAP_PX else (valid, seen)
+            ours, theirs = pixels[:, own], mosaic[:, other]
+            gain = np.clip(theirs.std(1) / np.maximum(ours.std(1), 1), *MATCH_GAIN_LIMITS)
+            offset = theirs.mean(1) - gain * ours.mean(1)
+            table = gain[:, None] * levels + offset[:, None]
+        fresh = valid & ~seen
+        mosaic[:, fresh] = apply_table(table, pixels)[:, fresh]
+        seen |= valid
+        tables.append(table)
+    return tables, mosaic[:, seen]
+
+
+def plan_tables(overviews):
+    import numpy as np
+
+    tables, mosaic = match_sources(overviews)
+    if not mosaic.size:
+        return [table.astype(np.uint8) for table in tables]
+    low, high = np.percentile(mosaic, STRETCH_PERCENTILES, axis=1)
+    span = high - low
+    gain = np.minimum(STRETCH_MAX_GAIN, 255 / np.maximum(span, 1))
+    base = np.clip(low - span * (gain - 1) / 2, 0, 255 - span * gain)
+    return [np.rint(np.clip(base[:, None] + gain[:, None] * (table - low[:, None]), 0, 255)).astype(np.uint8)
+            for table in tables]
+
+
+def read_chunk(x, y, sources, tables):
+    import mercantile
+    import numpy as np
     from shapely.geometry import box, shape
 
     tile = mercantile.Tile(x, y, CHUNK_Z)
     extent = box(*mercantile.bounds(tile))
-    transform = from_bounds(*mercantile.xy_bounds(tile), CHUNK_PX, CHUNK_PX)
     rgb = np.zeros((3, CHUNK_PX, CHUNK_PX), np.uint8)
     valid = np.zeros((CHUNK_PX, CHUNK_PX), bool)
-    for source in sources:
+    for source, table in zip(sources, tables):
         if valid.all():
             break
         if not shape(source.geometry).intersects(extent):
             continue
-        with rasterio.open(source.href) as src, WarpedVRT(
-                src, crs='EPSG:3857', transform=transform,
-                width=CHUNK_PX, height=CHUNK_PX, resampling=Resampling.cubic,
-                src_nodata=0, nodata=0) as vrt:
-            pixels = vrt.read((1, 2, 3))
+        pixels = read_warped(tile, CHUNK_PX, source)
         filled = pixels.any(0)
         fresh = filled & ~valid
-        rgb[:, fresh] = pixels[:, fresh]
+        rgb[:, fresh] = apply_table(table, pixels)[:, fresh]
         valid |= filled
     return np.dstack([rgb[0], rgb[1], rgb[2], valid * np.uint8(255)])
 
@@ -156,13 +213,26 @@ def encode(rgba):
     return out.getvalue()
 
 
-def cut_chunk(x, y, sources):
+def sharpen(rgba):
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    rgb, alpha = rgba[..., :3], rgba[..., 3]
+    sharp = Image.fromarray(np.ascontiguousarray(rgb)).filter(ImageFilter.UnsharpMask(**SHARPEN))
+    delta = np.clip(np.asarray(sharp, np.int16) - rgb, -SHARPEN_MAX_DELTA, SHARPEN_MAX_DELTA)
+    if (alpha < 255).any():
+        eroded = Image.fromarray(alpha).filter(ImageFilter.MinFilter(SHARPEN_EDGE_PX))
+        delta *= np.asarray(eroded)[..., None] == 255
+    return np.dstack([(rgb + delta).astype(np.uint8), alpha])
+
+
+def cut_chunk(x, y, sources, tables):
     """Return (tiles for CHUNK_Z..MAX_Z, the CHUNK_Z image or None if empty)."""
     import numpy as np
     from PIL import Image
 
     with stage('E3'):
-        rgba = read_chunk(x, y, sources)
+        rgba = read_chunk(x, y, sources, tables)
     with stage('E4'):
         if not rgba[..., 3].any():
             return [], None
@@ -173,9 +243,10 @@ def cut_chunk(x, y, sources):
             size = TILE_PX * n
             level = np.asarray(image if size == CHUNK_PX
                                else image.resize((size, size), Image.LANCZOS))
+            sharp = sharpen(level)
             for row in range(n):
                 for col in range(n):
-                    data = encode(level[row * TILE_PX:(row + 1) * TILE_PX,
+                    data = encode(sharp[row * TILE_PX:(row + 1) * TILE_PX,
                                         col * TILE_PX:(col + 1) * TILE_PX])
                     if data:
                         tiles.append((z, x * n + col, y * n + row, data))
@@ -203,7 +274,11 @@ def render_cell(x, y, sources):
     chunks = mercantile.children(mercantile.Tile(x, y, CELL_Z), zoom=CHUNK_Z)
     with stage('E4'), ProcessPoolExecutor(
             os.cpu_count(), mp_context=multiprocessing.get_context('fork')) as pool:
-        futures = [(c, pool.submit(cut_chunk, c.x, c.y, sources)) for c in chunks]
+        with stage('E3'):
+            overviews = list(pool.map(read_warped, repeat(mercantile.Tile(x, y, CELL_Z)),
+                                      repeat(OVERVIEW_PX), sources))
+        tables = plan_tables(overviews)
+        futures = [(c, pool.submit(cut_chunk, c.x, c.y, sources, tables)) for c in chunks]
         results = [(c, f.result()) for c, f in futures]
     with stage('E4'):
         tiles = [tile for _, (chunk_tiles, _) in results for tile in chunk_tiles]
@@ -211,7 +286,7 @@ def render_cell(x, y, sources):
         for z in range(CHUNK_Z - 1, CELL_Z - 1, -1):
             images = downsample(images)
             tiles += [(z, tx, ty, data) for (tx, ty), image in images.items()
-                      if (data := encode(image))]
+                      if (data := encode(sharpen(image)))]
     return tiles
 
 
